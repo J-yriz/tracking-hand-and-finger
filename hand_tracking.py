@@ -1,9 +1,11 @@
-"""Tracking tangan + jari + gesture thumbs-up pakai kamera + MediaPipe Tasks.
+"""Tracking tangan + jari + gesture thumbs-up & bahasa isyarat angka pakai kamera + MediaPipe Tasks.
 
 Cara jalan:
     pip install opencv-python mediapipe pillow
     python hand_tracking.py
     # q = keluar, f = ganti flip. Acungkan jempol ke atas = emoji 👍
+    # a = toggle deteksi angka bahasa isyarat
+    # v = toggle output suara (jika voice_output.py tersedia)
 """
 
 import argparse
@@ -46,9 +48,9 @@ FINGERS = {
     "Manis": ([13, 14, 15, 16], (0, 255, 0)),
     "Kelingking": ([17, 18, 19, 20], (0, 255, 255)),
 }
-FINGER_TIPS = {"Jempol": 4, "Telunjuk": 8, "Tengah": 12, "Manis": 16, "Kelingking": 20}
-
 # Sendi ukur per jari (a, sendi-b, c) utk status lurus/lipat.
+# Jempol diukur di 2 sendi (MCP 1-2-3 dan IP 2-3-4) karena 1 sudut saja
+# tidak cukup: jempol terlipat sering tetap "lurus" di sendi IP.
 FINGER_JOINTS = {
     "Jempol": (2, 3, 4),
     "Telunjuk": (5, 6, 7),
@@ -56,17 +58,17 @@ FINGER_JOINTS = {
     "Manis": (13, 14, 15),
     "Kelingking": (17, 18, 19),
 }
+THUMB_MCP_JOINT = (1, 2, 3)
 
-# WHY ambang diketatkan: 4 jari lipat maks 141° (thumbs_up Manis),
-# lurus min 168° (woman_hands Manis). Jempol beda anatomi: lipat 139°,
-# lurus min 155° (foto thumbs-up) -> ambang sendiri 150°.
-FINGER_EXT_MIN = 160.0
-THUMB_STATUS_MIN = 150.0
+# Ambang sudut (180 = lurus penuh). Stateless: anti-kedut ditangani oleh
+# NumberStabilizer di sign_number.py (majority vote), bukan di sini.
+FINGER_EXT_MIN = 160.0   # 4 jari: terangkat jika sudut PIP >= 160°
+THUMB_EXT_MIN = 150.0    # jempol: terangkat jika RATA-RATA sudut MCP+IP >= 150°
 
 # WHY ambang kalibrasi dari 4 foto uji (sudut di sendi PIP/IP, 180=lurus):
 # thumbs_up=(Jmp155,Tjk108,Tgh124,Mns141,Klk125) + jempol paling atas, di atas wrist.
 # pointing_up Tjk177, victory Tjk174/Tgh176, woman_hands semua ~170 -> tertolak.
-THUMB_EXT_MIN = 140.0
+THUMB_UP_MIN = 140.0
 FINGER_FOLD_MAX = 150.0
 THUMB_TOP_MARGIN = 0.02
 THUMB_WRIST_GAP = 0.03
@@ -89,12 +91,84 @@ from camera import (
     open_camera,
 )
 
+# Import classifier bahasa isyarat angka
+try:
+    from sign_number import NumberStabilizer, SignNumberClassifier
+    SIGN_CLASSIFIER = SignNumberClassifier()
+    SIGN_SUPPORT = True
+except ImportError:
+    SIGN_CLASSIFIER = None
+    NumberStabilizer = None
+    SIGN_SUPPORT = False
+
+# Import voice output (bunyi beneran via gTTS + mpg123/ffplay, fallback teks)
+try:
+    from voice_output import get_voice_output, toggle_voice_output
+    VOICE_SUPPORT = True
+except ImportError:
+    VOICE_SUPPORT = False
+
 
 def ensure_model() -> str:
     if not MODEL_PATH.exists():
         print(f"Download model ke {MODEL_PATH} ...")
         urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
     return str(MODEL_PATH)
+
+
+# Supresi wajah: kadang palm detector mengira wajah sebagai tangan.
+# Solusi: deteksi wajah via Haar cascade, lalu abaikan "tangan" yang
+# titik tengahnya jatuh di dalam kotak wajah.
+FACE_CASCADE_URL = ("https://raw.githubusercontent.com/opencv/opencv/master/"
+                    "data/haarcascades/haarcascade_frontalface_default.xml")
+FACE_CASCADE_PATH = Path(__file__).with_name("haarcascade_frontalface_default.xml")
+FACE_CHECK_EVERY = 3  # deteksi wajah tiap N frame (hemat CPU)
+_face_cascade = None
+
+
+def get_face_cascade():
+    """Muat Haar cascade (download sekali, lalu cache). None bila gagal."""
+    global _face_cascade
+    if _face_cascade is not None:
+        return _face_cascade
+    try:
+        if not FACE_CASCADE_PATH.exists():
+            print(f"Download face cascade ke {FACE_CASCADE_PATH} ...")
+            try:
+                import requests
+                r = requests.get(FACE_CASCADE_URL, timeout=30)
+                r.raise_for_status()
+                FACE_CASCADE_PATH.write_bytes(r.content)
+            except ImportError:
+                urllib.request.urlretrieve(FACE_CASCADE_URL, FACE_CASCADE_PATH)
+        cascade = cv2.CascadeClassifier(str(FACE_CASCADE_PATH))
+        if cascade.empty():
+            raise RuntimeError("cascade kosong")
+        _face_cascade = cascade
+        return _face_cascade
+    except Exception as e:
+        print(f"Warning: supresi wajah mati ({e}).")
+        return None
+
+
+def detect_faces(gray, cascade):
+    """Kembalikan list (x, y, w, h) wajah. Dideteksi di citra kecil biar cepat."""
+    h, w = gray.shape[:2]
+    scale = 320.0 / max(1, w)
+    small = cv2.resize(gray, (0, 0), fx=scale, fy=scale)
+    found = cascade.detectMultiScale(small, scaleFactor=1.1,
+                                     minNeighbors=5, minSize=(50, 50))
+    inv = 1.0 / scale
+    return [(int(x * inv), int(y * inv), int(fw * inv), int(fh * inv))
+            for (x, y, fw, fh) in found]
+
+
+def inside_face(cx, cy, face_rects, pad=15):
+    """True jika titik tengah tangan berada di dalam kotak wajah."""
+    for (fx, fy, fw, fh) in face_rects:
+        if fx - pad <= cx <= fx + fw + pad and fy - pad <= cy <= fy + fh + pad:
+            return True
+    return False
 
 
 def resolve_delegate(use_gpu: int) -> "BaseOptions.Delegate":
@@ -240,7 +314,7 @@ def is_thumbs_up(landmarks):
     """True jika jempol tegak ke atas dan 4 jari lain terlipat."""
     if len(landmarks) < 21:
         return False
-    if finger_angle(landmarks, 2, 3, 4) < THUMB_EXT_MIN:
+    if finger_angle(landmarks, 2, 3, 4) < THUMB_UP_MIN:
         return False
     for a, b, _c in [(5, 6, 7), (9, 10, 11), (13, 14, 15), (17, 18, 19)]:
         if finger_angle(landmarks, a, b, b + 1) > FINGER_FOLD_MAX:
@@ -253,6 +327,23 @@ def is_thumbs_up(landmarks):
     return landmarks[4].y < landmarks[0].y - THUMB_WRIST_GAP
 
 
+def is_finger_extended(name, landmarks) -> bool:
+    """True jika jari terangkat. Stateless (tanpa memori antar frame).
+
+    4 jari: sudut PIP >= FINGER_EXT_MIN.
+    Jempol: RATA-RATA sudut MCP (1-2-3) dan IP (2-3-4) >= THUMB_EXT_MIN.
+    Rata-rata 2 sendi memperbaiki bug lama: jempol terlipat tapi sendi IP
+    masih lurus sehingga salah terhitung terbuka (mis. angka 9, punggung
+    tangan, atau jempol tertutup rapat).
+    """
+    if name == "Jempol":
+        a, b, c = THUMB_MCP_JOINT
+        score = (finger_angle(landmarks, a, b, c) + finger_angle(landmarks, 2, 3, 4)) / 2.0
+        return score >= THUMB_EXT_MIN
+    a, b, c = FINGER_JOINTS[name]
+    return finger_angle(landmarks, a, b, c) >= FINGER_EXT_MIN
+
+
 def track_fingers(landmarks, w, h):
     """Status tiap jari: {nama: {angle, extended, tip, joints, color}}."""
     if len(landmarks) < 21:
@@ -261,11 +352,9 @@ def track_fingers(landmarks, w, h):
     details = {}
     for name, (idxs, color) in FINGERS.items():
         a, b, c = FINGER_JOINTS[name]
-        angle = finger_angle(landmarks, a, b, c)
-        thresh = THUMB_STATUS_MIN if name == "Jempol" else FINGER_EXT_MIN
         details[name] = {
-            "angle": angle,
-            "extended": angle >= thresh,
+            "angle": finger_angle(landmarks, a, b, c),
+            "extended": is_finger_extended(name, landmarks),
             "tip": pts[idxs[-1]],
             "joints": [pts[i] for i in idxs],
             "color": color,
@@ -306,6 +395,24 @@ def main(camera_index=0, flip_mode=None, max_hands=DEFAULT_MAX_HANDS, use_gpu=0)
     model_path = ensure_model()
     device_req = "GPU" if use_gpu == 1 else "CPU"
 
+    # Mode deteksi angka
+    detect_numbers = True
+    if SIGN_SUPPORT:
+        print("Classifier bahasa isyarat angka tersedia. Tekan 'a' untuk toggle.")
+        stabilizer = NumberStabilizer()
+    else:
+        print("Warning: sign_number.py tidak ditemukan. Deteksi angka dinonaktifkan.")
+        detect_numbers = False
+        stabilizer = None
+
+    # Voice output (default mati, tekan 'v' untuk nyalakan)
+    if VOICE_SUPPORT:
+        voice_output = get_voice_output(False)
+        print("Output suara tersedia (default mati). Tekan 'v' untuk toggle.")
+    else:
+        voice_output = None
+        print("Warning: voice_output.py tidak ditemukan. Output suara dinonaktifkan.")
+
     cap = open_camera(camera_index)
     if not cap.isOpened():
         print(f"Tidak bisa membuka kamera index {camera_index}")
@@ -313,69 +420,145 @@ def main(camera_index=0, flip_mode=None, max_hands=DEFAULT_MAX_HANDS, use_gpu=0)
 
     flip_idx = initial_flip_index(flip_mode)
 
-    print(f"Tracking tangan+jari jalan [{device_req}]. 'f'=flip, 'q'=keluar.")
+    print(f"Tracking tangan+jari jalan [{device_req}]. 'f'=flip, 'a'=angka, 'v'=suara, 'w'=supresi wajah, 'q'/Ctrl+C=keluar.")
     start = time.time()
+
+    # Supresi wajah (default ON). Wajah yang terdeteksi digambar abu-abu
+    # dan "tangan" palsu di area wajah diabaikan (tidak masuk hitungan angka).
+    suppress_face = True
+    face_cascade = get_face_cascade()
+    if face_cascade is None:
+        suppress_face = False
+    face_rects = []
+    frame_idx = 0
 
     landmarker_obj, device_str = create_hand_landmarker(model_path, max_hands, use_gpu)
     print(f"Device aktif: {device_str}")
-    with landmarker_obj as landmarker:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("Gagal membaca frame.")
-                break
+    try:
+        with landmarker_obj as landmarker:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    print("Gagal membaca frame.")
+                    break
 
-            flip_code = FLIP_CYCLE[flip_idx]
-            frame = apply_flip(frame, flip_code)
+                flip_code = FLIP_CYCLE[flip_idx]
+                frame = apply_flip(frame, flip_code)
+                frame_idx += 1
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            timestamp_ms = int((time.time() - start) * 1000)
-            result = landmarker.detect_for_video(mp_image, timestamp_ms)
+                # Deteksi wajah tiap beberapa frame (hemat CPU)
+                if suppress_face and face_cascade is not None and frame_idx % FACE_CHECK_EVERY == 0:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    face_rects = detect_faces(gray, face_cascade)
 
-            n_hands = len(result.hand_landmarks)
-            h_frame, w_frame = frame.shape[:2]
-            # Urutkan kiri-ke-kanan layar biar nomor stabil utk >2 tangan.
-            order = sorted(
-                range(n_hands),
-                key=lambda i: hand_center(result.hand_landmarks[i], w_frame, h_frame)[4],
-            )
-            for n, i in enumerate(order):
-                landmarks = result.hand_landmarks[i]
-                raw_side, score = extract_handedness(result, i)
-                anat_side = correct_side(raw_side, flip_code)
-                indo = _ID_SIDE.get(anat_side, anat_side)
-                _, _, _, _, cx, _ = hand_center(landmarks, w_frame, h_frame)
-                pos = screen_side(cx, w_frame)
-                color = _SIDE_COLOR.get(anat_side, (255, 255, 255))
-                details = draw_fingers(frame, landmarks)
-                n_up = sum(1 for d in details.values() if d["extended"])
-                label = f"T{n + 1} {indo} {score:.0%} {pos} | {n_up}/5"
-                draw_hand_box(frame, landmarks, label, color)
-                if is_thumbs_up(landmarks):
-                    x1, y1, _, _, _, _ = hand_center(landmarks, w_frame, h_frame)
-                    overlay_emoji(frame, (x1, max(0, y1 - 72)))
-                    cv2.putText(frame, "THUMBS UP!", (x1, max(20, y1 - 78)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                timestamp_ms = int((time.time() - start) * 1000)
+                result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
-            corrected = "koreksi-mirror ON" if flip_code in MIRROR_SWAP_FLIPS else "koreksi-mirror OFF"
-            cv2.putText(frame, f"Terdeteksi: {n_hands}/{max_hands} tangan",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8, (255, 0, 0), 2)
-            cv2.putText(frame, f"Flip: {FLIP_NAMES[flip_code]} | {corrected} | {device_str}",
-                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6, (255, 0, 0), 2)
-            cv2.imshow("Hand Tracking (tangan+jari)", frame)
+                n_hands = len(result.hand_landmarks)
+                h_frame, w_frame = frame.shape[:2]
+                # Urutkan kiri-ke-kanan layar biar nomor stabil utk >2 tangan.
+                order = sorted(
+                    range(n_hands),
+                    key=lambda i: hand_center(result.hand_landmarks[i], w_frame, h_frame)[4],
+                )
+                # Kumpulkan details semua tangan untuk deteksi angka
+                all_hand_details = []
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-            elif key == ord("f"):
-                flip_idx = next_flip_index(flip_idx)
-                print(f"Mode flip: {FLIP_NAMES[FLIP_CYCLE[flip_idx]]}")
+                for n, i in enumerate(order):
+                    landmarks = result.hand_landmarks[i]
+                    x1, y1, x2, y2, cx, cy = hand_center(landmarks, w_frame, h_frame)
 
-    cap.release()
-    cv2.destroyAllWindows()
+                    # Abaikan "tangan" yang sebenarnya wajah
+                    if suppress_face and inside_face(cx, cy, face_rects):
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (128, 128, 128), 2)
+                        cv2.putText(frame, "Wajah (diabaikan)", (x1, max(0, y1 - 10)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
+                        continue
+
+                    raw_side, score = extract_handedness(result, i)
+                    anat_side = correct_side(raw_side, flip_code)
+                    indo = _ID_SIDE.get(anat_side, anat_side)
+                    pos = screen_side(cx, w_frame)
+                    color = _SIDE_COLOR.get(anat_side, (255, 255, 255))
+                    details = draw_fingers(frame, landmarks)
+                    n_up = sum(1 for d in details.values() if d["extended"])
+
+                    # Simpan details untuk total hitungan
+                    if details:
+                        all_hand_details.append(details)
+
+                    label = f"T{n + 1} {indo} {score:.0%} {pos} | {n_up}/5"
+                    draw_hand_box(frame, landmarks, label, color)
+                    if is_thumbs_up(landmarks):
+                        x1, y1, _, _, _, _ = hand_center(landmarks, w_frame, h_frame)
+                        overlay_emoji(frame, (x1, max(0, y1 - 72)))
+                        cv2.putText(frame, "THUMBS UP!", (x1, max(20, y1 - 78)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+                # Gambar kotak wajah agar user tahu area itu dilindungi
+                if suppress_face:
+                    for (fx, fy, fw, fh) in face_rects:
+                        cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh), (128, 128, 128), 1)
+
+                # Deteksi angka total dari semua tangan (anti-kedut via stabilizer)
+                if detect_numbers and SIGN_CLASSIFIER and stabilizer is not None:
+                    if not all_hand_details:
+                        stabilizer.reset()
+                    else:
+                        if len(all_hand_details) == 1:
+                            raw, conf = SIGN_CLASSIFIER.classify_single_hand(all_hand_details[0])
+                        else:
+                            raw, conf = SIGN_CLASSIFIER.classify_multiple_hands(all_hand_details)
+                        stable = stabilizer.update(raw) if conf > 0.7 else None
+                        if stable is not None:
+                            cv2.putText(frame, f"TOTAL ANGKA: {stable}", (w_frame // 2 - 100, 100),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+                            if voice_output is not None and voice_output.enabled:
+                                voice_output.speak(stable)
+
+                corrected = "koreksi-mirror ON" if flip_code in MIRROR_SWAP_FLIPS else "koreksi-mirror OFF"
+                n_real = len(all_hand_details)
+                face_note = f" (+{n_hands - n_real} wajah)" if n_hands > n_real else ""
+                cv2.putText(frame, f"Terdeteksi: {n_real}/{max_hands} tangan{face_note}",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8, (255, 0, 0), 2)
+                cv2.putText(frame, f"Flip: {FLIP_NAMES[flip_code]} | {corrected} | {device_str}",
+                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, (255, 0, 0), 2)
+                cv2.imshow("Hand Tracking (tangan+jari)", frame)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                elif key == ord("f"):
+                    flip_idx = next_flip_index(flip_idx)
+                    print(f"Mode flip: {FLIP_NAMES[FLIP_CYCLE[flip_idx]]}")
+                elif key == ord("a") and SIGN_SUPPORT:
+                    detect_numbers = not detect_numbers
+                    if stabilizer is not None:
+                        stabilizer.reset()
+                    status = "ON" if detect_numbers else "OFF"
+                    print(f"Deteksi angka bahasa isyarat: {status}")
+                elif key == ord("v") and VOICE_SUPPORT:
+                    voice_on = toggle_voice_output()
+                    status = "ON" if voice_on else "OFF"
+                    print(f"Output suara: {status}")
+                elif key == ord("w"):
+                    if face_cascade is None:
+                        face_cascade = get_face_cascade()
+                    suppress_face = not suppress_face and face_cascade is not None
+                    if not suppress_face:
+                        face_rects = []
+                    status = "ON" if suppress_face else "OFF"
+                    print(f"Supresi wajah: {status}")
+    except KeyboardInterrupt:
+        print("\nDihentikan oleh pengguna (Ctrl+C).")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        print("Program ditutup bersih.")
 
 
 if __name__ == "__main__":
@@ -388,5 +571,8 @@ if __name__ == "__main__":
                         help="0=CPU (default), 1=GPU (fallback ke CPU bila gagal)")
     args = parser.parse_args()
     initial = FLIP_ARG_MAP[args.flip]
-    main(camera_index=args.camera, flip_mode=initial, max_hands=args.max_hands,
-         use_gpu=args.gpu)
+    try:
+        main(camera_index=args.camera, flip_mode=initial, max_hands=args.max_hands,
+             use_gpu=args.gpu)
+    except KeyboardInterrupt:
+        print("\nDihentikan oleh pengguna (Ctrl+C).")

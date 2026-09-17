@@ -31,6 +31,10 @@ env/
 *.task
 hand_landmarker.task
 
+# Auto-downloaded / generated runtime files
+haarcascade_frontalface_default.xml
+voice_cache/
+
 # OpenCV / runtime
 *.avi
 *.mp4
